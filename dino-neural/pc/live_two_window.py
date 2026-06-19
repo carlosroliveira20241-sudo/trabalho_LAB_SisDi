@@ -380,24 +380,27 @@ class LiveApp:
             loc = "ARDUINO" if self.router.location["forward_pass"] == protocol.LOC_ARDUINO else "PC"
             surf.blit(small.render(f"forward_pass rodando em: {loc}", True, DIM), (16, 66))
 
-        # botão de transição
+        # botão de transição — fica no rodapé, ABAIXO do canvas do jogo (ver
+        # game_rect mais abaixo: antes essas faixas se sobrepunham e o canvas
+        # branco, desenhado depois, cobria o botão por completo)
         if self.phase == PHASE_TRAIN:
             lbl, bcol = "Enviar p/ Arduino e jogar", (180, 140, 255)
         elif self.phase == PHASE_TRAINING:
             lbl, bcol = "Treinando...", (140, 140, 150)
         else:
             lbl, bcol = "Voltar a treinar", (230, 90, 90)
-        tr = pygame.Rect(16, GAME_H - 96, 280, 36)
+        footer_top = GAME_H - 80
+        tr = pygame.Rect(16, footer_top + 6, 280, 36)
         pygame.draw.rect(surf, PANEL2, tr, border_radius=10)
         pygame.draw.rect(surf, bcol, tr, 1, border_radius=10)
         t = font.render(lbl, True, bcol)
         surf.blit(t, (tr.x + (tr.width - t.get_width()) // 2, tr.y + 9))
         self.game_buttons = {"transition": tr}
 
-        surf.blit(small.render(self.status_msg, True, DIM), (16, GAME_H - 52))
+        surf.blit(small.render(self.status_msg, True, DIM), (16, footer_top + 50))
 
-        # cena do jogo
-        game_rect = pygame.Rect(16, 96, GAME_W - 32, GAME_H - 96 - 44)
+        # cena do jogo — entre o cabeçalho (acima) e o rodapé (botão+status)
+        game_rect = pygame.Rect(16, 90, GAME_W - 32, footer_top - 90 - 6)
         gs = pygame.Surface(game_rect.size)
         gs.fill((247, 247, 247))
         ground_y = int(physics.GROUND_Y * game_rect.height / physics.HEIGHT)
