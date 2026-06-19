@@ -49,7 +49,7 @@ PHASE_TRAINING = "training"  # treino em background (thread própria) — jogo p
 PHASE_AUTO = "auto"          # Arduino (ou PC, em fallback) jogando sozinho
 
 GAME_W, GAME_H = 760, 460
-MEM_W, MEM_H = 640, 800
+MEM_W, MEM_H = 720, 860
 
 # limites válidos de cada região de memória (ver comm/monitor.py)
 MEM_BOUNDS = {
@@ -446,11 +446,13 @@ class LiveApp:
         surf.blit(small.render(">", True, TXT), (next_r.x + 13, next_r.y + 7))
         self.mem_buttons["page_prev"] = prev_r
         self.mem_buttons["page_next"] = next_r
+        # linha própria (não ao lado dos botões): com região longa o texto
+        # passava da borda direita da janela e ficava cortado.
         surf.blit(small.render(f"{self.mem_base:#06x}..{self.mem_base + 255:#06x}  (regiao: {lo:#06x}-{hi - 1:#06x})",
-                                True, DIM), (bx + 104, 65))
+                                True, DIM), (20, 94))
 
         if self.mem_stale:
-            surf.blit(small.render("dados desatualizados — sem resposta do Arduino", True, RED), (20, 94))
+            surf.blit(small.render("dados desatualizados — sem resposta do Arduino", True, RED), (20, 112))
 
         data = self.mem_cache
         if not data:
