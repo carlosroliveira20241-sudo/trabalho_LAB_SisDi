@@ -111,6 +111,7 @@ class LiveApp:
         self.mem_region = "SRAM"
         self.mem_cache = b""
         self.mem_stale = False
+        self.mem_error = ""
         self.mem_base = self.monitor.net_addr if self.monitor else SRAM_START
 
         self.game_buttons: dict[str, pygame.Rect] = {}
@@ -302,8 +303,12 @@ class LiveApp:
                 data += reader(base + off, 64)
             self.mem_cache = bytes(data)
             self.mem_stale = False
-        except Exception:
-            self.mem_stale = True               # leitura falhou: mantém o cache, mas avisa
+            self.mem_error = ""
+        except Exception as e:
+            # leitura falhou: mantém o cache, mas avisa — guarda o erro real
+            # (antes era engolido, dava só "desatualizado" sem dizer o motivo)
+            self.mem_stale = True
+            self.mem_error = str(e)
 
     # ---------------- cliques ----------------
     def click_game(self, pos):
@@ -455,7 +460,10 @@ class LiveApp:
                                 True, DIM), (20, 94))
 
         if self.mem_stale:
-            surf.blit(small.render("dados desatualizados — sem resposta do Arduino", True, RED), (20, 112))
+            msg = "dados desatualizados"
+            if self.mem_error:
+                msg += f" — {self.mem_error}"
+            surf.blit(small.render(msg, True, RED), (20, 112))
 
         data = self.mem_cache
         if not data:
