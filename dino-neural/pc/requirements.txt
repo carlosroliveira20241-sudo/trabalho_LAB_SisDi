@@ -1,0 +1,6 @@
+pygame>=2.5
+pyserial>=3.5
+numpy>=1.26
+textual>=0.50
+rich>=13.7
+neat-python>=0.92
