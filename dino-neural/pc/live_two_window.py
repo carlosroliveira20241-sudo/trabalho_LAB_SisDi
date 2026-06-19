@@ -26,6 +26,8 @@ Uso (de dentro de pc/):
 from __future__ import annotations
 
 import argparse
+import threading
+import time
 
 import numpy as np
 import pygame
@@ -35,19 +37,26 @@ from comm import protocol
 from comm.serial_comm import SerialComm
 from comm.port_select import choose_port
 from comm.delegator import Router
-from comm.monitor import Monitor
+from comm.monitor import Monitor, SRAM_START, SRAM_END, EEPROM_SIZE, FLASH_SIZE
 from bench.benchmark import Benchmark
 from neural.neural_net import NeuralNet, dino_policy_weights
-from neural.reward import step_reward
 from game.dino_game_headless import DinoGameHeadless, ACTION_JUMP, ACTION_DUCK, ACTION_NONE
 from game.obstacle import CACTUS_AND_DUCK, Kind
 from game import physics
 
-PHASE_TRAIN = "train"
-PHASE_AUTO = "auto"
+PHASE_TRAIN = "train"        # você joga, o PC grava (sem treinar ainda)
+PHASE_TRAINING = "training"  # treino em background (thread própria) — jogo pausado
+PHASE_AUTO = "auto"          # Arduino (ou PC, em fallback) jogando sozinho
 
 GAME_W, GAME_H = 760, 460
-MEM_W, MEM_H = 640, 720
+MEM_W, MEM_H = 640, 800
+
+# limites válidos de cada região de memória (ver comm/monitor.py)
+MEM_BOUNDS = {
+    "SRAM": (SRAM_START, SRAM_END + 1),
+    "EEPROM": (0, EEPROM_SIZE),
+    "FLASH": (0, FLASH_SIZE),
+}
 
 BG = (18, 19, 26)
 PANEL = (28, 30, 40)
@@ -80,7 +89,6 @@ class LiveApp:
         self.net.set_weights(dino_policy_weights())
         self.router = Router(serial_comm, self.bench)
         self.router.register_pc("forward_pass", lambda s: self.net.forward(s))
-        self.router.register_pc("calcula_recompensa", lambda p, d: step_reward(p, d))
         self.router.register_pc("backpropagation", lambda s, a, adv: self.net.backward(s, a, adv))
         self.router.register_pc("atualiza_pesos", lambda g, lr: self.net.apply_gradients(g, lr))
         for name in self.router.location:
@@ -90,7 +98,7 @@ class LiveApp:
             try:
                 self.monitor.resolve_net_addr()
             except Exception:
-                self.monitor.net_addr, self.monitor.net_size = 0x0100, 0
+                self.monitor.net_addr, self.monitor.net_size = SRAM_START, 0
 
         self.game = DinoGameHeadless(kinds=CACTUS_AND_DUCK)
         self.phase = PHASE_TRAIN
@@ -98,10 +106,12 @@ class LiveApp:
         self.demo_actions: list = []
         self.last_buttons = (False, False)
         self.status_msg = "Jogue com os botões — o dino imita você depois."
+        self.training_busy = False
 
         self.mem_region = "SRAM"
         self.mem_cache = b""
-        self.mem_base = self.monitor.net_addr if self.monitor else 0x0100
+        self.mem_stale = False
+        self.mem_base = self.monitor.net_addr if self.monitor else SRAM_START
         self._mem_timer = 0.0
 
         self.game_buttons: dict[str, pygame.Rect] = {}
@@ -147,39 +157,89 @@ class LiveApp:
     def step(self):
         if self.phase == PHASE_TRAIN:
             self.step_train()
-        else:
+        elif self.phase == PHASE_AUTO:
             self.step_auto()
+        # PHASE_TRAINING: jogo pausado enquanto o treino roda em background
 
     # ---------------- transição treino -> Arduino ----------------
     def send_to_arduino(self):
-        if self.phase != PHASE_TRAIN:
+        """Dispara o treino numa thread própria — a UI (as duas janelas)
+        continua respondendo enquanto o treino (que pode envolver milhares de
+        frames gravados) roda em background."""
+        if self.phase != PHASE_TRAIN or self.training_busy:
             return
         n = len(self.demo_states)
         if n == 0:
             self.status_msg = "Nada gravado ainda — jogue um pouco primeiro."
             return
-        for s, a in zip(self.demo_states, self.demo_actions):
-            grad = self.router.call("backpropagation", s, a, 1.0)
-            self.router.call("atualiza_pesos", grad, 0.01)
+        states, actions = list(self.demo_states), list(self.demo_actions)
         self.demo_states.clear()
         self.demo_actions.clear()
-        if self.serial:
-            try:
-                self.serial.request(protocol.CMD_SET_WEIGHTS,
-                                     protocol.pack_floats(*self.net.get_weights()))
-                self.router.location["forward_pass"] = protocol.LOC_ARDUINO
-                self.status_msg = f"Treinado com {n} jogadas — Arduino jogando sozinho."
-            except Exception as e:
-                self.status_msg = f"Treinou no PC, mas falhou enviar os pesos: {e}"
+        self.training_busy = True
+        self.phase = PHASE_TRAINING
+        self.status_msg = f"Treinando com {n} jogadas..."
+        threading.Thread(target=self._train_worker, args=(states, actions), daemon=True).start()
+
+    @staticmethod
+    def _balance_classes(states, actions):
+        """A maioria dos frames gravados é ACTION_NONE (você só aperta botão
+        perto do obstáculo) — sem isso, o gradiente médio fica dominado por
+        'não fazer nada'. Mantém todos os frames de pular/abaixar e amostra só
+        uma quantidade equivalente de frames de 'nada'."""
+        actions_arr = np.asarray(actions)
+        none_idx = np.flatnonzero(actions_arr == ACTION_NONE)
+        other_idx = np.flatnonzero(actions_arr != ACTION_NONE)
+        if len(other_idx) == 0 or len(none_idx) <= len(other_idx):
+            return states, actions
+        rng = np.random.default_rng()
+        keep_none = rng.choice(none_idx, size=len(other_idx), replace=False)
+        keep = np.sort(np.concatenate([keep_none, other_idx]))
+        return [states[i] for i in keep], [int(actions_arr[i]) for i in keep]
+
+    def _train_worker(self, states, actions):
+        """Roda fora da thread de render: calcula o gradiente médio (sobre o
+        conjunto balanceado) e aplica UMA única atualização — mais estável que
+        milhares de passos sequenciais de lr fixo — depois envia os pesos ao
+        Arduino e migra forward_pass pra ele via Router.move (mesma convenção
+        de delegação/CMD_DELEGATE usada no resto do projeto)."""
+        try:
+            states_b, actions_b = self._balance_classes(states, actions)
+            grads = [self.router.call("backpropagation", s, a, 1.0) for s, a in zip(states_b, actions_b)]
+            mean_grad = np.mean(grads, axis=0)
+            self.router.call("atualiza_pesos", mean_grad, 0.3)
+            if self.serial:
+                self.router.move("forward_pass", protocol.LOC_ARDUINO, sync_state=self._sync_weights_move)
+                self.status_msg = (f"Treinado com {len(states)} jogadas "
+                                    f"({len(states_b)} balanceadas) — Arduino jogando sozinho.")
+            else:
+                self.status_msg = (f"Treinado com {len(states)} jogadas "
+                                    f"({len(states_b)} balanceadas) — sem Arduino, IA fica no PC.")
+        except Exception as e:
+            self.status_msg = f"Falha no treino/envio dos pesos: {e}"
+        finally:
+            self.game.reset()
+            self.phase = PHASE_AUTO
+            self.training_busy = False
+
+    def _sync_weights_move(self, frm, to):
+        """`sync_state` do Router.move: PC->Arduino manda os pesos treinados;
+        Arduino->PC lê de volta (espelha o padrão de studio.py)."""
+        if to == protocol.LOC_ARDUINO:
+            self.serial.request(protocol.CMD_SET_WEIGHTS,
+                                 protocol.pack_floats(*self.net.get_weights()))
         else:
-            self.status_msg = f"Treinado com {n} jogadas (sem Arduino — a IA fica no PC)."
-        self.phase = PHASE_AUTO
-        self.game.reset()
+            resp = self.serial.request(protocol.CMD_GET_WEIGHTS)
+            self.net.set_weights(protocol.unpack_floats(resp.payload))
 
     def back_to_training(self):
         if self.phase != PHASE_AUTO:
             return
-        self.router.location["forward_pass"] = protocol.LOC_PC
+        if self.serial and self.router.location["forward_pass"] == protocol.LOC_ARDUINO:
+            try:
+                self.router.move("forward_pass", protocol.LOC_PC, sync_state=self._sync_weights_move)
+            except Exception as e:
+                self.status_msg = f"Erro ao voltar pro PC: {e}"
+                self.router.location["forward_pass"] = protocol.LOC_PC
         self.phase = PHASE_TRAIN
         self.status_msg = "De volta ao treino — jogue para gravar de novo."
         self.game.reset()
@@ -201,8 +261,9 @@ class LiveApp:
             for off in range(0, 256, 64):       # 256 bytes em 4 leituras
                 data += reader(base + off, 64)
             self.mem_cache = bytes(data)
+            self.mem_stale = False
         except Exception:
-            pass                                 # leitura falhou: mantém o cache
+            self.mem_stale = True               # leitura falhou: mantém o cache, mas avisa
 
     # ---------------- cliques ----------------
     def click_game(self, pos):
@@ -211,18 +272,35 @@ class LiveApp:
                 if sid == "transition":
                     if self.phase == PHASE_TRAIN:
                         self.send_to_arduino()
-                    else:
+                    elif self.phase == PHASE_AUTO:
                         self.back_to_training()
+                    # PHASE_TRAINING: botão ocupado, clique ignorado
                 break
 
     def click_memory(self, pos):
         for sid, r in self.mem_buttons.items():
-            if r.collidepoint(pos) and sid.startswith("mem_"):
+            if not r.collidepoint(pos):
+                continue
+            if sid.startswith("mem_"):
                 self.mem_region = sid[4:]
-                self.mem_base = self.monitor.net_addr if (self.mem_region == "SRAM" and self.monitor) else 0x0000
+                self.mem_base = (self.monitor.net_addr if (self.mem_region == "SRAM" and self.monitor)
+                                  else MEM_BOUNDS[self.mem_region][0])
                 self.mem_cache = b""
                 self._mem_timer = 0.0
-                break
+            elif sid == "page_prev":
+                self._page_memory(-256)
+            elif sid == "page_next":
+                self._page_memory(256)
+            break
+
+    def _page_memory(self, delta):
+        """Navega em blocos de 256 bytes dentro da região, sem sair dos
+        limites válidos (a UI antes só mostrava sempre os primeiros 256
+        bytes de EEPROM/FLASH, sem jeito de ver o resto)."""
+        lo, hi = MEM_BOUNDS[self.mem_region]
+        self.mem_base = max(lo, min(hi - 256, self.mem_base + delta))
+        self.mem_cache = b""
+        self._mem_timer = 0.0
 
     # ---------------- desenho: janela do JOGO ----------------
     def draw_game(self, font, big, small) -> pygame.Surface:
@@ -236,8 +314,12 @@ class LiveApp:
 
         if self.phase == PHASE_TRAIN:
             phase_lbl, phase_col = "FASE 1 — VOCÊ JOGA (botões)", ACCENT
+        elif self.phase == PHASE_TRAINING:
+            phase_lbl, phase_col = "TREINANDO — aguarde...", (255, 200, 60)
         else:
-            phase_lbl, phase_col = "FASE 2 — ARDUINO JOGA SOZINHO", (255, 165, 60)
+            on_arduino = self.router.location["forward_pass"] == protocol.LOC_ARDUINO
+            phase_lbl = "FASE 2 — ARDUINO JOGA SOZINHO" if on_arduino else "FASE 2 — PC JOGA SOZINHO (fallback)"
+            phase_col = (255, 165, 60) if on_arduino else (200, 160, 90)
         surf.blit(big.render(phase_lbl, True, phase_col), (16, 34))
 
         # estado dos botões (feedback visual de que a placa está respondendo)
@@ -252,6 +334,8 @@ class LiveApp:
 
         if self.phase == PHASE_TRAIN:
             surf.blit(small.render(f"gravado: {len(self.demo_states)} jogadas", True, DIM), (16, 66))
+        elif self.phase == PHASE_TRAINING:
+            surf.blit(small.render("calculando gradiente e sincronizando com o Arduino...", True, DIM), (16, 66))
         else:
             loc = "ARDUINO" if self.router.location["forward_pass"] == protocol.LOC_ARDUINO else "PC"
             surf.blit(small.render(f"forward_pass rodando em: {loc}", True, DIM), (16, 66))
@@ -259,6 +343,8 @@ class LiveApp:
         # botão de transição
         if self.phase == PHASE_TRAIN:
             lbl, bcol = "Enviar p/ Arduino e jogar", (180, 140, 255)
+        elif self.phase == PHASE_TRAINING:
+            lbl, bcol = "Treinando...", (140, 140, 150)
         else:
             lbl, bcol = "Voltar a treinar", (230, 90, 90)
         tr = pygame.Rect(16, GAME_H - 96, 280, 36)
@@ -310,13 +396,29 @@ class LiveApp:
             self.mem_buttons["mem_" + reg] = r
             bx += 106
 
+        # paginação dentro da região (antes só dava pra ver os primeiros 256 bytes)
+        lo, hi = MEM_BOUNDS[self.mem_region]
+        prev_r = pygame.Rect(bx + 14, 56, 36, 30)
+        next_r = pygame.Rect(bx + 56, 56, 36, 30)
+        pygame.draw.rect(surf, PANEL2, prev_r, border_radius=8)
+        pygame.draw.rect(surf, PANEL2, next_r, border_radius=8)
+        surf.blit(small.render("<", True, TXT), (prev_r.x + 13, prev_r.y + 7))
+        surf.blit(small.render(">", True, TXT), (next_r.x + 13, next_r.y + 7))
+        self.mem_buttons["page_prev"] = prev_r
+        self.mem_buttons["page_next"] = next_r
+        surf.blit(small.render(f"{self.mem_base:#06x}..{self.mem_base + 255:#06x}  (regiao: {lo:#06x}-{hi - 1:#06x})",
+                                True, DIM), (bx + 104, 65))
+
+        if self.mem_stale:
+            surf.blit(small.render("dados desatualizados — sem resposta do Arduino", True, RED), (20, 94))
+
         data = self.mem_cache
         if not data:
             surf.blit(small.render("lendo...", True, DIM), (20, 100))
             return surf
 
         cols, cell = 16, 36
-        gx, gy = 70, 110
+        gx, gy = 70, 130
         net = (self.monitor.net_addr, self.monitor.net_size)
         for idx, b in enumerate(data):
             row, c = divmod(idx, cols)
@@ -328,7 +430,7 @@ class LiveApp:
             if c == 0:
                 surf.blit(small.render(f"{addr:04X}", True, DIM), (gx - 56, y + 9))
 
-        ly = gy + (len(data) // cols + 1) * cell + 18
+        ly = gy + -(-len(data) // cols) * cell + 18   # divisão de cols arredondada p/ cima
         surf.blit(small.render("baixo", True, DIM), (gx, ly + 3))
         for k in range(130):
             pygame.draw.rect(surf, heat_color(int(k / 130 * 255)), (gx + 50 + k * 2, ly, 2, 16))
@@ -351,11 +453,19 @@ def main() -> None:
         port = choose_port(args.port)
         if port:
             print(f"Conectando em {port}...")
-            sc = SerialComm(port, args.baud)
-            sc.open()
-            if sc.request(protocol.CMD_PING, b"\x01").payload != b"\x01":
-                print("PING falhou — siga em modo offline (--no-serial) ou cheque o sketch.")
-                sc.close(); sc = None
+            try:
+                sc = SerialComm(port, args.baud)
+                sc.open()
+                if sc.request(protocol.CMD_PING, b"\x01").payload != b"\x01":
+                    raise RuntimeError("PING sem eco esperado (firmware errado na placa?)")
+            except Exception as e:
+                print(f"Não consegui conectar ({e}) — seguindo em modo offline (sem Arduino).")
+                if sc is not None:
+                    try:
+                        sc.close()
+                    except Exception:
+                        pass
+                sc = None
         else:
             print("Sem porta — rodando offline (sem Arduino).")
 
@@ -401,6 +511,12 @@ def main() -> None:
         tex2.draw()
         r_mem.present()
 
+    # dá um tempo pro treino em background (se ainda estiver rodando) terminar
+    # antes de fechar a serial por baixo dele
+    for _ in range(50):
+        if not app.training_busy:
+            break
+        time.sleep(0.05)
     if sc:
         sc.close()
     pygame.quit()
