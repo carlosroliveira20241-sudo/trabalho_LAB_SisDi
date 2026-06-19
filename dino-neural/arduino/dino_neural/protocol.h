@@ -26,6 +26,8 @@
 #define CMD_SET_ALGO     0x05
 #define CMD_SET_WEIGHTS  0x06
 #define CMD_REWARD       0x07
+#define CMD_BUTTONS      0x08   // payload vazio -> u8 bitmask (bit0=jump, bit1=duck)
+#define CMD_UPDATE_W     0x09   // payload: N_WEIGHTS x f32 grad + f32 lr -> aplica e ACK
 
 // --- PC -> Arduino : MONITOR (dump) ---
 #define CMD_PORTS        0x10
@@ -41,8 +43,7 @@
 #define FUNC_FORWARD   0
 #define FUNC_BACKPROP  1
 #define FUNC_UPDATE_W  2
-#define FUNC_EXTRACT   3
-#define FUNC_REWARD    4
+#define FUNC_REWARD    3
 
 #define LOC_PC      0
 #define LOC_ARDUINO 1

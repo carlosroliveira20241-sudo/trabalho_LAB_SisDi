@@ -2,9 +2,9 @@
  * neural_net.h — rede feed-forward na SRAM do ATmega328P (header-only).
  *
  * Topologia FIXA (igual a pc/neural/neural_net.py) para permitir sync de pesos:
- *   entrada(3) -> oculta(4) -> saída(2)   [tanh na oculta, softmax na saída]
+ *   entrada(4) -> oculta(4) -> saída(3)   [tanh na oculta, softmax na saída]
  *
- * Pesos:  W1[3][4] + b1[4] + W2[4][2] + b2[2] = 26 floats = 104 bytes.
+ * Pesos:  W1[4][4] + b1[4] + W2[4][3] + b2[3] = 35 floats = 140 bytes.
  * São variáveis globais (SRAM); o endereço é exportado via CMD_NET_ADDR para o
  * dump da aba Memória conseguir apontar exatamente para os pesos.
  *
