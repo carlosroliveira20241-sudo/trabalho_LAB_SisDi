@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(SDL_VIDEODRIVER=dummy python train_pc.py --fast --episodes 1000)",
+      "Bash(SDL_VIDEODRIVER=dummy python -c ' *)",
+      "Bash(python -c \"import neat; print\\('neat-python', neat.__version__ if hasattr\\(neat,'__version__'\\) else 'ok', 'instalado'\\)\")",
+      "Bash(python -m py_compile bench_arduino.py comm/serial_comm.py comm/delegator.py comm/protocol.py comm/port_select.py)",
+      "Bash(python -m comm.port_select)",
+      "Bash(mkdir -p dino_neural)",
+      "Bash(mv dino_neural.ino protocol.h neural_net.h monitor.h policy_gradient.h dino_neural/)",
+      "Read(//c/c/Users/Carlos R/Desktop/Poesia/dino-neural/arduino/**)",
+      "Bash(arduino-cli version *)",
+      "Read(//c/Program Files/**)",
+      "Bash('/c/Program Files/Arduino CLI/arduino-cli' core list)",
+      "Bash('/c/Program Files/Arduino CLI/arduino-cli' upload -p COM4 --fqbn arduino:avr:uno 'C:/Users/Carlos R/Desktop/Poesia/dino-neural/arduino/dino_neural')",
+      "Bash(python diag_serial.py COM4)",
+      "Bash(python bench_arduino.py --port COM4 --n 200)",
+      "Bash(python -m py_compile live_delegation.py neural/neural_net.py)",
+      "Bash(python -c ' *)",
+      "Bash('/c/Program Files/Arduino CLI/arduino-cli' compile --fqbn arduino:avr:uno 'C:/Users/Carlos R/Desktop/Poesia/dino-neural/arduino/dino_neural')",
+      "Bash(pip install *)",
+      "Bash(PYTHONIOENCODING=cp1252 python -c ' *)"
+    ]
+  }
+}
