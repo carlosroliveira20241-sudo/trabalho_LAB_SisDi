@@ -112,19 +112,61 @@ class LiveApp:
         self.mem_cache = b""
         self.mem_stale = False
         self.mem_base = self.monitor.net_addr if self.monitor else SRAM_START
-        self._mem_timer = 0.0
 
         self.game_buttons: dict[str, pygame.Rect] = {}
         self.mem_buttons: dict[str, pygame.Rect] = {}
 
+        # estado mantido fresco por _io_loop (thread própria) — o render nunca
+        # bloqueia esperando a serial: lê/escreve só essas variáveis simples.
+        self._btn_state = (False, False)     # último estado dos botões (Fase 1)
+        self._pending_state: list | None = None  # estado aguardando decisão remota (Fase 3)
+        self._auto_action = ACTION_NONE          # última decisão remota conhecida
+        self._stop_io = threading.Event()
+        self._io_thread = threading.Thread(target=self._io_loop, daemon=True)
+        self._io_thread.start()
+
+    # ---------------- I/O serial em thread própria (não bloqueia o render) --
+    def _io_loop(self):
+        """Só esta thread fala com a serial fora do treino: leitura dos botões
+        (Fase 1), decisão remota do forward_pass (Fase 3) e dump de memória —
+        exatamente a separação que o README descreve ("jogo desacoplado do
+        serial"), que `step_train`/`step_auto`/`refresh_memory` violavam ao
+        chamar a serial direto no loop de render."""
+        next_mem = 0.0
+        while not self._stop_io.is_set():
+            did_work = False
+            if self.phase == PHASE_TRAIN and self.monitor is not None:
+                try:
+                    b = self.monitor.read_buttons()
+                    self._btn_state = (b.jump, b.duck)
+                    did_work = True
+                except Exception:
+                    pass
+            elif (self.phase == PHASE_AUTO
+                    and self.router.location["forward_pass"] == protocol.LOC_ARDUINO
+                    and self._pending_state is not None):
+                state, self._pending_state = self._pending_state, None
+                try:
+                    probs = self.router.call("forward_pass", state)
+                    self._auto_action = int(np.argmax(probs))
+                except Exception as e:
+                    self.status_msg = f"forward_pass falhou ({e}) — voltando pro PC"
+                    self.router.location["forward_pass"] = protocol.LOC_PC
+                did_work = True
+
+            now = time.time()
+            if self.monitor is not None and now >= next_mem:
+                next_mem = now + 0.3
+                self._refresh_memory_once()
+                did_work = True
+
+            if not did_work:
+                time.sleep(0.01)
+
     # ---------------- leitura dos pushbuttons ----------------
     def _read_buttons(self):
         if self.monitor is not None:
-            try:
-                b = self.monitor.read_buttons()
-                return b.jump, b.duck
-            except Exception:
-                pass
+            return self._btn_state            # mantido fresco por _io_loop
         keys = pygame.key.get_pressed()  # fallback p/ testar sem a placa
         return bool(keys[pygame.K_UP] or keys[pygame.K_SPACE]), bool(keys[pygame.K_DOWN])
 
@@ -143,13 +185,15 @@ class LiveApp:
     # ---------------- fase 2: Arduino decide, PC só aplica ----------------
     def step_auto(self):
         state = self.game.features()
-        try:
-            probs = self.router.call("forward_pass", state)
-        except Exception as e:
-            self.status_msg = f"forward_pass falhou ({e}) — voltando pro PC"
-            self.router.location["forward_pass"] = protocol.LOC_PC
-            probs = self.net.forward(state)
-        action = int(np.argmax(probs))
+        if self.router.location["forward_pass"] == protocol.LOC_ARDUINO:
+            # decisão remota é assíncrona (via _io_loop): aplica a última
+            # conhecida agora e entrega o estado atual pra próxima rodada —
+            # ~1 frame de atraso, mas o render nunca espera o round-trip.
+            self._pending_state = state
+            action = self._auto_action
+        else:
+            probs = self.router.call("forward_pass", state)  # local: instantâneo
+            action = int(np.argmax(probs))
         self.game.step(action)
         if self.game.is_dead:
             self.game.reset()
@@ -245,13 +289,9 @@ class LiveApp:
         self.game.reset()
 
     # ---------------- memória (dump ao vivo) ----------------
-    def refresh_memory(self, dt):
-        if not self.monitor:
-            return
-        self._mem_timer -= dt
-        if self._mem_timer > 0:
-            return
-        self._mem_timer = 0.3
+    def _refresh_memory_once(self):
+        """Lê 256 bytes da região atual. Chamado só por _io_loop (serial é
+        bloqueante) — nunca direto do loop de render."""
         reader = {"SRAM": self.monitor.read_sram,
                   "EEPROM": self.monitor.read_eeprom,
                   "FLASH": self.monitor.read_flash}[self.mem_region]
@@ -483,7 +523,7 @@ def main() -> None:
     app = LiveApp(sc)
     running = True
     while running:
-        dt = clock.tick(60) / 1000.0
+        clock.tick(60)
         for e in pygame.event.get():
             ewin = getattr(e, "window", None)
             if e.type == pygame.WINDOWCLOSE:
@@ -497,7 +537,6 @@ def main() -> None:
                 running = False
 
         app.step()
-        app.refresh_memory(dt)
 
         game_surf = app.draw_game(font, big, small)
         tex = Texture.from_surface(r_game, game_surf)
@@ -517,6 +556,8 @@ def main() -> None:
         if not app.training_busy:
             break
         time.sleep(0.05)
+    app._stop_io.set()
+    app._io_thread.join(timeout=1.0)
     if sc:
         sc.close()
     pygame.quit()
