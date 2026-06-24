@@ -70,6 +70,12 @@ class Adc:
         return self.value / 1023.0 * 5.0
 
 
+@dataclass
+class Buttons:
+    jump: bool
+    duck: bool
+
+
 class Monitor:
     def __init__(self, serial_comm: SerialComm):
         self.serial = serial_comm
@@ -104,6 +110,12 @@ class Monitor:
     def read_flash(self, addr: int, length: int) -> bytes:
         payload = addr.to_bytes(2, "little") + bytes([length])
         return self.serial.request(protocol.CMD_READ_FLASH, payload).payload
+
+    def read_buttons(self) -> Buttons:
+        """Lê os dois pushbuttons ligados direto nos pinos digitais (pull-up
+        interno, sem protoboard): bit0=jump, bit1=duck, 1=pressionado."""
+        mask = self.serial.request(protocol.CMD_BUTTONS).payload[0]
+        return Buttons(jump=bool(mask & 0x01), duck=bool(mask & 0x02))
 
     def resolve_net_addr(self) -> int:
         """Pergunta ao Arduino onde a rede neural está na SRAM (CMD_NET_ADDR)."""

@@ -1,24 +1,35 @@
 /*
  * dino_neural.ino — sketch do Arduino Uno (ATmega328P).
  *
- * Passo atual: BENCHMARK DE DELEGAÇÃO. O Arduino executa o forward pass de uma
- * rede fixa (3->4->2) e devolve, junto do resultado, o tempo de cálculo medido
- * com micros() — é isso que alimenta o benchmark PC vs Arduino.
+ * Passo atual: BENCHMARK DE DELEGAÇÃO. O Arduino executa o forward pass e o
+ * treino (Policy Gradient completo: backward + apply) de uma rede fixa
+ * (4->4->3) e devolve, junto do resultado, o tempo de cálculo medido com
+ * micros() — é isso que alimenta o benchmark PC vs Arduino.
  *
  * Também responde aos comandos de MONITOR/dump (portas, timers, ADC, flags,
- * SRAM/FLASH/EEPROM) — a atividade do monitor interno do ATmega328P.
+ * SRAM/FLASH/EEPROM) — a atividade do monitor interno do ATmega328P — e aos
+ * dois pushbuttons ligados direto nos pinos digitais (sem protoboard: usa o
+ * pull-up interno do ATmega328P, então o botão só precisa ligar o pino ao GND).
  *
  * Loop: lê um frame da serial, despacha pelo comando e responde.
  * Baud 250000 para reduzir o overhead de transporte.
  */
 #include "protocol.h"
 #include "neural_net.h"
+#include "policy_gradient.h"
 #include "monitor.h"
+
+// Botões: uma perna no pino, outra no GND. INPUT_PULLUP dispensa resistor
+// e protoboard — pressionado = LOW.
+#define BTN_JUMP_PIN 2
+#define BTN_DUCK_PIN 3
 
 void setup() {
   Serial.begin(250000);
   Serial.setTimeout(100);      // timeout p/ readBytes (ms)
   net_init();
+  pinMode(BTN_JUMP_PIN, INPUT_PULLUP);
+  pinMode(BTN_DUCK_PIN, INPUT_PULLUP);
 }
 
 void loop() {
@@ -38,6 +49,39 @@ void loop() {
       net_forward(in, out);
       uint32_t dt = micros() - t0;
       sendNeuralResult(CMD_FORWARD, dt, (uint8_t *)out, sizeof(out));
+      break;
+    }
+
+    case CMD_BACKPROP: {         // backpropagation delegada: estado+ação+adv -> gradiente
+      float in[N_IN];
+      memcpy(in, f.payload, sizeof(in));
+      uint8_t action = f.payload[sizeof(in)];
+      float advantage;
+      memcpy(&advantage, f.payload + sizeof(in) + 1, sizeof(advantage));
+      float grad[N_WEIGHTS];
+      uint32_t t0 = micros();
+      pg_backward(in, action, advantage, grad);
+      uint32_t dt = micros() - t0;
+      sendNeuralResult(CMD_BACKPROP, dt, (uint8_t *)grad, sizeof(grad));
+      break;
+    }
+
+    case CMD_UPDATE_W: {         // atualiza_pesos delegada: gradiente+lr -> aplica e ACK
+      float grad[N_WEIGHTS], lr;
+      memcpy(grad, f.payload, sizeof(grad));
+      memcpy(&lr, f.payload + sizeof(grad), sizeof(lr));
+      uint32_t t0 = micros();
+      pg_apply(grad, lr);
+      uint32_t dt = micros() - t0;
+      sendNeuralResult(CMD_UPDATE_W, dt, NULL, 0);
+      break;
+    }
+
+    case CMD_BUTTONS: {          // bit0=jump, bit1=duck, 1=pressionado (lógica invertida no read)
+      uint8_t mask = 0;
+      if (digitalRead(BTN_JUMP_PIN) == LOW) mask |= 0x01;
+      if (digitalRead(BTN_DUCK_PIN) == LOW) mask |= 0x02;
+      sendFrame(CMD_BUTTONS, &mask, 1);
       break;
     }
 
