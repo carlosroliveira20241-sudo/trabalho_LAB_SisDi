@@ -70,17 +70,12 @@ class NeuralNet:
         e = np.exp(z - np.max(z))
         return e / e.sum()
 
-    def pg_step(self, x, action: int, advantage: float, lr: float,
-                entropy_beta: float = 0.0) -> None:
-        """Um passo de gradiente do REINFORCE (gradient ASCENT).
+    def backward(self, x, action: int, advantage: float) -> np.ndarray:
+        """Gradiente da log-prob da softmax (REINFORCE), sem tocar nos pesos.
 
-        Aumenta a probabilidade de `action` proporcionalmente a `advantage`
-        (retorno já normalizado). Recalcula o forward para ter os caches —
-        barato no PC e mantém este método autossuficiente.
-
-        Gradiente da log-prob da softmax nos logits z2:  (onehot(action) - probs)
-        `entropy_beta` > 0 adiciona um bônus de entropia, mantendo a exploração
-        e evitando o colapso para uma ação fixa (ex.: "pular sempre").
+        Espelha pg_backward no Arduino byte-a-byte: mesma fórmula, mesma ordem
+        de saída (dW1, db1, dW2, db2) que `get_weights`/`set_weights`, para que
+        o gradiente calculado num lado seja aplicável no outro.
         """
         x = np.asarray(x, dtype=np.float32)
         z1 = x @ self.W1 + self.b1
@@ -92,12 +87,6 @@ class NeuralNet:
         dz2[action] += 1.0          # onehot - probs
         dz2 *= advantage            # direção de subida escalada pelo retorno
 
-        if entropy_beta:
-            logp = np.log(probs + 1e-8)
-            H = -(probs * logp).sum()
-            dH = -probs * (logp + H)        # gradiente da entropia nos logits
-            dz2 = dz2 + entropy_beta * dH
-
         dW2 = np.outer(a1, dz2)
         db2 = dz2
         da1 = self.W2 @ dz2
@@ -105,10 +94,20 @@ class NeuralNet:
         dW1 = np.outer(x, dz1)
         db1 = dz1
 
-        self.W1 += lr * dW1
-        self.b1 += lr * db1
-        self.W2 += lr * dW2
-        self.b2 += lr * db2
+        return np.concatenate([dW1.ravel(), db1, dW2.ravel(), db2]).astype(np.float32)
+
+    def apply_gradients(self, grad, lr: float) -> None:
+        """Aplica o passo de gradiente ASCENT: W += lr * grad (mesma ordem de get_weights)."""
+        grad = np.asarray(grad, dtype=np.float32)
+        i = 0
+        def take(n):
+            nonlocal i
+            chunk = grad[i:i + n]; i += n
+            return chunk
+        self.W1 += lr * take(N_IN * N_HID).reshape(N_IN, N_HID)
+        self.b1 += lr * take(N_HID)
+        self.W2 += lr * take(N_HID * N_OUT).reshape(N_HID, N_OUT)
+        self.b2 += lr * take(N_OUT)
 
     # --- (de)serialização para sync com o Arduino ---------------------------
     def get_weights(self) -> np.ndarray:

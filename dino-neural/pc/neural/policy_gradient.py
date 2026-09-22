@@ -20,7 +20,6 @@ class PolicyGradient:
         self.router = router
         self.net = net
         self.lr = lr
-        self.entropy_beta = 0.02  # bônus de entropia (mantém exploração)
         self._batch = []          # episódios acumulados até o próximo update()
         self._reset_episode()
 
@@ -53,8 +52,9 @@ class PolicyGradient:
         numa probabilidade fixa). A vantagem é normalizada sobre o lote inteiro,
         que serve de baseline.
 
-        Quando `backpropagation` estiver no Arduino, este loop passa a chamar
-        router.call("backpropagation", ...) por passo, em vez de net.pg_step.
+        Cada passo passa pelo Router em DUAS chamadas delegáveis de verdade:
+        "backpropagation" (calcula o gradiente) e "atualiza_pesos" (aplica),
+        cada uma podendo estar no PC ou no Arduino independentemente.
         """
         if not self._batch:
             return
@@ -66,8 +66,8 @@ class PolicyGradient:
         rets = np.asarray(rets, dtype=np.float32)
         adv = (rets - rets.mean()) / (rets.std() + 1e-6)   # baseline = média do lote
         for state, action, a in zip(states, actions, adv):
-            self.net.pg_step(state, action, float(a), self.lr,
-                             entropy_beta=self.entropy_beta)
+            grad = self.router.call("backpropagation", state, action, float(a))
+            self.router.call("atualiza_pesos", grad, self.lr)
         self._batch = []
 
     def _discounted_returns(self):

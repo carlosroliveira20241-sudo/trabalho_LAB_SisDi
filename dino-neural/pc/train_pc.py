@@ -33,6 +33,8 @@ def build_trainer():
         router.location[name] = protocol.LOC_PC
     net = NeuralNet(seed=0)
     router.register_pc("forward_pass", lambda s: net.forward(s))
+    router.register_pc("backpropagation", lambda s, a, adv: net.backward(s, a, adv))
+    router.register_pc("atualiza_pesos", lambda grad, lr: net.apply_gradients(grad, lr))
     trainer = PolicyGradient(router, net, lr=0.01)
     return trainer, net, bench
 
@@ -41,7 +43,7 @@ def run_episode(game: DinoGameHeadless, trainer: PolicyGradient, render=None) ->
     game.reset()
     trainer._reset_episode()
     while not game.is_dead:
-        state = game.state_vector()
+        state = game.features()
         action = trainer.act(state)          # 0 = nada, 1 = pular
         reward = game.step(action)
         trainer.observe(reward)

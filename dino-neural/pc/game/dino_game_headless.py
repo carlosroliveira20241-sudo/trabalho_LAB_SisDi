@@ -101,15 +101,6 @@ class DinoGameHeadless:
             "score": self.score,
         }
 
-    def state_vector(self):
-        """Os 3 valores normalizados (legado, Policy Gradient): [dist, vel, altura]."""
-        s = self.game_state()
-        return [
-            s["distance_to_obstacle"] / physics.WIDTH,
-            s["current_speed"] / physics.SPEED_MAX,
-            s["obstacle_height"] / physics.HEIGHT,
-        ]
-
     def features(self):
         """As 4 entradas da rede 4->4->3 (e do NEAT): distância, velocidade e a
         posição vertical (topo e base) do próximo obstáculo — o que permite

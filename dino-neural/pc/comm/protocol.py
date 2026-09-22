@@ -22,13 +22,15 @@ START = 0xAA
 CMD_PING          = 0x00   # teste de conexão: o Arduino ecoa o payload de volta
 
 # --- PC -> Arduino : comandos NEURAIS ---------------------------------------
-CMD_FORWARD       = 0x01   # payload: f32 dist, f32 vel, f32 altura
-CMD_BACKPROP      = 0x02   # payload: f32 dist, f32 vel, f32 altura, f32 reward
+CMD_FORWARD       = 0x01   # payload: N_IN x f32 (dist, vel, topo, base) -> N_OUT x f32 (probs)
+CMD_BACKPROP      = 0x02   # payload: N_IN x f32 estado, u8 ação, f32 advantage -> N_WEIGHTS x f32 gradiente
 CMD_DELEGATE      = 0x03   # payload: u8 func_id, u8 location (0=PC, 1=Arduino)
 CMD_GET_WEIGHTS   = 0x04   # payload: vazio
 CMD_SET_ALGO      = 0x05   # payload: u8 algo_id (0=PG, 1=DQN, 2=NEAT)
 CMD_SET_WEIGHTS   = 0x06   # payload: N x f32 (sync ao migrar função)
 CMD_REWARD        = 0x07   # payload: u8 passou_obstaculo, u8 morreu -> f32 reward
+CMD_BUTTONS       = 0x08   # payload: vazio -> u8 bitmask (bit0=jump, bit1=duck), 1=pressionado
+CMD_UPDATE_W      = 0x09   # payload: N_WEIGHTS x f32 (gradiente) + f32 lr -> aplica W += lr*grad
 
 # --- PC -> Arduino : comandos MONITOR (dump do ATmega328P) ------------------
 CMD_PORTS         = 0x10   # PORTB/C/D + DDRx + PINx
@@ -48,8 +50,7 @@ CMD_NET_ADDR      = 0x17   # endereço-base da rede na SRAM + tamanho
 FUNC_FORWARD      = 0
 FUNC_BACKPROP     = 1
 FUNC_UPDATE_W     = 2
-FUNC_EXTRACT      = 3
-FUNC_REWARD       = 4
+FUNC_REWARD       = 3
 
 LOC_PC      = 0
 LOC_ARDUINO = 1

@@ -32,6 +32,7 @@ from bench.benchmark import Benchmark
 from comm.monitor import Monitor
 from neural.neural_net import NeuralNet, dino_policy_weights, N_IN, N_HID, N_OUT
 from neural.reward import step_reward
+from neural.imitation import ImitationLearner
 from game.dino_game_headless import DinoGameHeadless, ACTION_JUMP, ACTION_DUCK, ACTION_NONE
 from game.obstacle import CACTUS_AND_DUCK, Kind, Obstacle
 from game.dino import Dino
@@ -125,8 +126,8 @@ SCREENS = [("1  Principal", "main"), ("2  Memoria", "memory"), ("3  Delegacao", 
 DELEGABLE = [
     ("forward_pass", "decide a ação (rede)", True),
     ("calcula_recompensa", "calcula o reward", True),
-    ("backpropagation", "treina os pesos", False),     # ainda só PC
-    ("atualiza_pesos", "aplica gradiente", False),
+    ("backpropagation", "treina os pesos", True),
+    ("atualiza_pesos", "aplica gradiente", True),
 ]
 
 
@@ -153,9 +154,12 @@ class Studio:
         self.router = Router(serial_comm, self.bench)
         self.router.register_pc("forward_pass", lambda s: self.net.forward(s))
         self.router.register_pc("calcula_recompensa", lambda p, d: step_reward(p, d))
+        self.router.register_pc("backpropagation", lambda s, a, adv: self.net.backward(s, a, adv))
+        self.router.register_pc("atualiza_pesos", lambda grad, lr: self.net.apply_gradients(grad, lr))
         for name in self.router.location:
             self.router.location[name] = protocol.LOC_PC
         self.monitor = Monitor(serial_comm) if serial_comm else None
+        self.imitation = ImitationLearner(self.router, self.net)
 
         if serial_comm:
             # sincroniza os pesos calibrados na placa e descobre onde a rede vive
@@ -176,6 +180,8 @@ class Studio:
         self.mem_base = self.monitor.net_addr if self.monitor else 0x0100
         self._mem_timer = 0.0
         self.buttons = {}                # rects clicáveis
+        # modo "jogar via botões" (imitação: o dino aprende a copiar o humano)
+        self.human_mode = False
         # modo aprendizado (NEAT ao vivo, em thread separada)
         self.learning = False
         self.neat_trainer = None
@@ -338,8 +344,58 @@ class Studio:
                     
             self.generation_done_event.set()
 
+    # ---------------- jogar via botões (imitação) ----------------
+    def toggle_human_mode(self):
+        """Liga/desliga o modo onde VOCÊ joga (botões) e o dino imita."""
+        if self.learning:
+            return  # mutuamente exclusivo com o aprendizado NEAT ao vivo
+        self.human_mode = not self.human_mode
+        if self.human_mode:
+            self.game.reset()
+            self.prev_score = 0
+
+    @staticmethod
+    def _keyboard_buttons():
+        """Substituto de teclado p/ testar sem a placa (sem serial -> sem CMD_BUTTONS)."""
+        keys = pygame.key.get_pressed()
+        return keys[pygame.K_UP] or keys[pygame.K_SPACE], keys[pygame.K_DOWN]
+
+    def _read_buttons(self):
+        if self.monitor is not None:
+            try:
+                btn = self.monitor.read_buttons()
+                return btn.jump, btn.duck
+            except Exception:
+                pass
+        return self._keyboard_buttons()
+
+    def _step_human(self):
+        jump, duck = self._read_buttons()
+        action = ACTION_JUMP if jump else (ACTION_DUCK if duck else ACTION_NONE)
+        state = self.game.features()
+        self.net.forward(state)                      # popula o cache p/ a viz
+        self.acts = (np.asarray(state), self.net._cache["a1"], self.net._cache["out"])
+        self.game.step(action)
+        self.imitation.record(state, action)          # treina a rede a imitar você
+        if self.game.is_dead:
+            self.game.reset()
+            self.prev_score = 0
+
+    def _pull_weights(self):
+        """Lê os pesos atuais do Arduino e sincroniza no PC (Arduino -> PC)."""
+        if not self.serial:
+            return
+        try:
+            resp = self.serial.request(protocol.CMD_GET_WEIGHTS)
+            self.net.set_weights(protocol.unpack_floats(resp.payload))
+        except Exception:
+            pass
+
     # ---------------- lógica (roda todo frame, em qualquer tela) ----------------
     def step_ai(self):
+        if self.human_mode:
+            self._step_human()
+            return
         if self.learning:
             self._step_learning()
             return
@@ -433,9 +489,14 @@ class Studio:
     def _screen_main(self, surf, font, big, small):
         net_rect = pygame.Rect(SIDEBAR + 20, 20, W - SIDEBAR - 40, 360)
         game_rect = pygame.Rect(SIDEBAR + 20, 396, W - SIDEBAR - 40, 300)
-        title = f"Aprendendo (NEAT) — Geração {self.generation}" if self.learning else "Rede neural  (neurônios acendem ao ativar)"
+        if self.human_mode:
+            title = "Você está jogando — o dino aprende a imitar (botões)"
+        elif self.learning:
+            title = f"Aprendendo (NEAT) — Geração {self.generation}"
+        else:
+            title = "Rede neural  (neurônios acendem ao ativar)"
         self._panel(surf, net_rect, title)
-        
+
         # botão de controle (Aprender/Parar) no canto superior direito
         learn_lbl = "Parar" if self.learning else "Aprender"
         learn_col = (230, 90, 90) if self.learning else (180, 140, 255)
@@ -447,10 +508,25 @@ class Studio:
         surf.blit(lbl_surf, (r.x + (r.width - lbl_surf.get_width()) // 2, r.y + 6))
         self.buttons["net_learn"] = r
 
+        # botão "Jogar (botões)" — modo imitação, ao lado do botão Aprender
+        human_lbl = "Parar" if self.human_mode else "Jogar (botões)"
+        human_col = (230, 90, 90) if self.human_mode else GREEN
+        rh = pygame.Rect(r.x - 150, r.y, 140, 28)
+        pygame.draw.rect(surf, PANEL2, rh, border_radius=8)
+        pygame.draw.rect(surf, human_col, rh, 1, border_radius=8)
+        hlbl_surf = small.render(human_lbl, True, human_col)
+        surf.blit(hlbl_surf, (rh.x + (rh.width - hlbl_surf.get_width()) // 2, rh.y + 6))
+        self.buttons["net_human"] = rh
+
         # Desenha a rede neural
         self._draw_network(surf, net_rect, font, small)
-        
-        playing = "NEAT populacional" if self.learning else "rede fixa"
+
+        if self.human_mode:
+            playing = "você (botões) — dino imita"
+        elif self.learning:
+            playing = "NEAT populacional"
+        else:
+            playing = "rede fixa"
         self._panel(surf, game_rect, f"Jogo do dino  ({playing} jogando)")
         self._draw_game(surf, game_rect.inflate(-16, -16).move(0, 8))
 
@@ -753,15 +829,22 @@ class Studio:
                 self.mem_base = self.monitor.net_addr if (self.mem_region == "SRAM" and self.monitor) else 0x0000
                 self.mem_cache = b""
                 self._mem_timer = 0.0
+            elif sid == "net_human":
+                self.toggle_human_mode()
             elif sid.startswith("tog_"):
                 name = sid[4:]
                 cur = self.router.location[name]
                 to_loc = protocol.LOC_ARDUINO if cur == protocol.LOC_PC else protocol.LOC_PC
                 try:
                     def sync(frm, to):
+                        # funções que tocam nos pesos: sincroniza no sentido da migração
+                        # p/ a IA continuar igual depois de trocar de lado.
                         if to == protocol.LOC_ARDUINO:
                             self._sync_weights()
-                    self.router.move(name, to_loc, sync_state=sync if name == "forward_pass" else None)
+                        else:
+                            self._pull_weights()
+                    needs_sync = name in ("forward_pass", "backpropagation", "atualiza_pesos")
+                    self.router.move(name, to_loc, sync_state=sync if needs_sync else None)
                 except Exception as ex:
                     print(f"[Delegação] Erro ao mover {name} para o Arduino: {ex}")
             break

@@ -28,24 +28,19 @@ from bench.benchmark import Benchmark
 
 # nomes legíveis <-> func_id do protocolo
 FUNC_IDS = {
-    "forward_pass":      protocol.FUNC_FORWARD,
-    "backpropagation":   protocol.FUNC_BACKPROP,
-    "atualiza_pesos":    protocol.FUNC_UPDATE_W,
-    "extrai_estado":     protocol.FUNC_EXTRACT,
+    "forward_pass":       protocol.FUNC_FORWARD,
+    "backpropagation":    protocol.FUNC_BACKPROP,
+    "atualiza_pesos":     protocol.FUNC_UPDATE_W,
     "calcula_recompensa": protocol.FUNC_REWARD,
 }
 
-# padrão de localização inicial (ver tabela do blueprint)
+# padrão de localização inicial: tudo no PC até o usuário delegar pela UI.
 DEFAULT_LOCATION = {
-    "forward_pass":      protocol.LOC_ARDUINO,
-    "backpropagation":   protocol.LOC_ARDUINO,
-    "atualiza_pesos":    protocol.LOC_ARDUINO,
-    "extrai_estado":     protocol.LOC_PC,
+    "forward_pass":       protocol.LOC_PC,
+    "backpropagation":    protocol.LOC_PC,
+    "atualiza_pesos":     protocol.LOC_PC,
     "calcula_recompensa": protocol.LOC_PC,
 }
-
-# extrai_estado e envia_acao são sempre no PC (não delegáveis) -> não migram.
-NON_DELEGABLE = {"envia_acao_ao_jogo"}
 
 
 class Router:
@@ -57,6 +52,7 @@ class Router:
         self._arduino_cmds: dict[str, int] = {
             "forward_pass": protocol.CMD_FORWARD,
             "backpropagation": protocol.CMD_BACKPROP,
+            "atualiza_pesos": protocol.CMD_UPDATE_W,
             "calcula_recompensa": protocol.CMD_REWARD,
         }
         self._locks: dict[str, threading.Lock] = {
@@ -86,7 +82,6 @@ class Router:
         return result
 
     def _call_arduino(self, name: str, *args, **kwargs):
-        # TODO: empacotar args conforme o comando (ex.: forward = 3 floats)
         cmd = self._arduino_cmds[name]
         payload = self._pack_args(name, *args, **kwargs)
         resp = self.serial.request(cmd, payload)
@@ -106,8 +101,6 @@ class Router:
         `sync_state(from_loc, to_loc)` é chamado com o lock segurado, antes da
         troca, para sincronizar pesos/estado entre os lados.
         """
-        if name in NON_DELEGABLE:
-            raise ValueError(f"{name} não é delegável")
         with self._locks[name]:
             frm = self.location[name]
             if frm == to:
@@ -124,17 +117,32 @@ class Router:
     # --- helpers de (de)serialização por função -----------------------------
     def _pack_args(self, name: str, *args, **kwargs) -> bytes:
         if name == "forward_pass":
-            state = args[0]                       # [dist, vel, altura]
+            state = args[0]                       # [dist, vel, topo, base]
             return protocol.pack_floats(*[float(x) for x in state])
         if name == "calcula_recompensa":
             passed, died = args[0], args[1]       # bool/int
             return bytes([1 if passed else 0, 1 if died else 0])
+        if name == "backpropagation":
+            state, action, advantage = args[0], args[1], args[2]
+            payload = protocol.pack_floats(*[float(x) for x in state])
+            payload += bytes([int(action)])
+            payload += protocol.pack_floats(float(advantage))
+            return payload
+        if name == "atualiza_pesos":
+            grad, lr = args[0], args[1]           # N_WEIGHTS floats + lr
+            payload = protocol.pack_floats(*[float(x) for x in grad])
+            payload += protocol.pack_floats(float(lr))
+            return payload
         raise NotImplementedError(f"empacotamento de {name} ainda não implementado")
 
     def _unpack_result(self, name: str, data: bytes):
         import numpy as np
         if name == "forward_pass":
-            return np.asarray(protocol.unpack_floats(data))   # [out_0, out_1]
+            return np.asarray(protocol.unpack_floats(data))   # [out_0..out_N]
         if name == "calcula_recompensa":
             return protocol.unpack_floats(data)[0]            # f32 reward
+        if name == "backpropagation":
+            return np.asarray(protocol.unpack_floats(data))   # N_WEIGHTS floats
+        if name == "atualiza_pesos":
+            return None                                       # ACK vazio
         raise NotImplementedError(f"desempacotamento de {name} ainda não implementado")

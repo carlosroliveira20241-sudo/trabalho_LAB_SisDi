@@ -23,29 +23,54 @@ from comm.delegator import Router
 from comm.monitor import Monitor
 from bench.benchmark import Benchmark
 from game.dino_game import DinoGame
-from game.dino_game_headless import ACTION_NONE
 from neural.neural_net import NeuralNet
 from neural.policy_gradient import PolicyGradient
+from neural.reward import step_reward
+
+UPDATE_EVERY_EPISODES = 5
 
 
 def build_pc_impls(router: Router, net: NeuralNet) -> None:
     """Registra as implementações locais (PC) das funções delegáveis."""
     router.register_pc("forward_pass", lambda state: net.forward(state))
-    # TODO: backpropagation, atualiza_pesos, calcula_recompensa
-    #       (cada uma com a mesma assinatura da versão Arduino)
+    router.register_pc("backpropagation", lambda s, a, adv: net.backward(s, a, adv))
+    router.register_pc("atualiza_pesos", lambda grad, lr: net.apply_gradients(grad, lr))
+    router.register_pc("calcula_recompensa", lambda passed, died: step_reward(passed, died))
 
 
 def ai_loop(game: DinoGame, trainer, stop: threading.Event) -> None:
-    """Decide ações e treina. Ritmo limitado pelo lado ativo (vide benchmark)."""
+    """Decide ações e treina. Ritmo limitado pelo lado ativo (vide benchmark).
+
+    Desacoplado do loop de render (que roda em FPS livre): aqui só lemos o
+    estado do `engine` e escrevemos a próxima ação; o fim de episódio é
+    detectado por `engine.is_dead` e a recompensa de cada frame por
+    `engine.last_reward` (já calculada pelo motor a cada `step`).
+    """
+    last_frame = -1
+    was_dead = False
+    episodes = 0
     while not stop.is_set():
-        state = game.engine.state_vector()
-        try:
-            action = trainer.act(state)
-        except NotImplementedError:
-            action = ACTION_NONE
+        engine = game.engine
+        if engine.is_dead:
+            if not was_dead:
+                trainer.end_episode()
+                episodes += 1
+                if episodes % UPDATE_EVERY_EPISODES == 0:
+                    trainer.update()
+                was_dead = True
+            time.sleep(0.01)
+            continue
+        was_dead = False
+
+        state = engine.features()
+        action = trainer.act(state)
         game.set_action(action)
-        # TODO: observar recompensa, detectar fim de episódio -> trainer.end_episode()
-        time.sleep(0.0)  # cede a CPU; o gargalo real é o forward (PC ou serial)
+
+        # espera o loop do jogo consumir a ação e avançar o frame
+        while engine.frames == last_frame and not engine.is_dead and not stop.is_set():
+            time.sleep(0.001)
+        last_frame = engine.frames
+        trainer.observe(engine.last_reward)
 
 
 def main() -> None:
