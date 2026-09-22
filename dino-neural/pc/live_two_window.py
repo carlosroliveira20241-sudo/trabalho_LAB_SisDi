@@ -151,8 +151,8 @@ class LiveApp:
                     probs = self.router.call("forward_pass", state)
                     self._auto_action = int(np.argmax(probs))
                 except Exception as e:
-                    self.status_msg = f"forward_pass falhou ({e}) — voltando pro PC"
-                    self.router.location["forward_pass"] = protocol.LOC_PC
+                    # mantém no Arduino — usa a última ação conhecida e tenta de novo
+                    self.status_msg = f"forward_pass falhou ({e}) — tentando de novo..."
                 did_work = True
 
             now = time.time()
@@ -186,15 +186,9 @@ class LiveApp:
     # ---------------- fase 2: Arduino decide, PC só aplica ----------------
     def step_auto(self):
         state = self.game.features()
-        if self.router.location["forward_pass"] == protocol.LOC_ARDUINO:
-            # decisão remota é assíncrona (via _io_loop): aplica a última
-            # conhecida agora e entrega o estado atual pra próxima rodada —
-            # ~1 frame de atraso, mas o render nunca espera o round-trip.
-            self._pending_state = state
-            action = self._auto_action
-        else:
-            probs = self.router.call("forward_pass", state)  # local: instantâneo
-            action = int(np.argmax(probs))
+        # sempre usa o Arduino — nunca cai pro PC jogar sozinho
+        self._pending_state = state
+        action = self._auto_action
         self.game.step(action)
         if self.game.is_dead:
             self.game.reset()
